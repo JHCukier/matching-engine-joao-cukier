@@ -1,8 +1,5 @@
 """Núcleo do livro de ofertas (order book) da Matching Engine.
 
-Commit 1: modelo de ordem (`Order`) e estrutura de um lado do livro
-(`BookSide`), com rastreio do melhor preço e da ordem na cabeça da fila.
-
 Premissas de design:
     * Preços sempre em ``decimal.Decimal`` (nunca ``float``).
     * Prioridade temporal por ``seq`` inteiro e determinístico, gerado
@@ -13,6 +10,7 @@ Premissas de design:
 
 from __future__ import annotations
 
+from bisect import bisect_left, insort
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -33,13 +31,6 @@ class OrderType(str, Enum):
     MARKET = "market"
     PEG = "peg"
 
-"""Em vez de escrever o clássico def __init__(self, id, side...): e gastar 10 linhas, 
-   o decorador @dataclass gera o construtor automaticamente.
-   
-   Cada objeto criado carrega um dicionário oculto na memória para permitir a adição de
-   novas variáveis em tempo de execução. Isso consome muita RAM. O slots=True bloqueia isso, 
-   travando a estrutura da classe e economizando muita memória
-"""
 
 @dataclass(slots=True, eq=False)
 class Order:
@@ -47,8 +38,6 @@ class Order:
 
     ``eq=False`` mantém a comparação por identidade (a ordem é uma entidade,
     não um valor) e preserva o ``__hash__`` padrão.
-    Uma ordem só é igual à outra se for o exato mesmo objeto no mesmo endereço de memória.
-    Isso é vital para usarmos as ordens como chaves seguras no nosso dicionário global.
 
     Attributes:
         id: Identificador único da ordem (chave em ``index`` e nas filas).
@@ -68,10 +57,6 @@ class Order:
     price: Decimal | None = None
     leaves_qty: int = field(init=False)
 
-    """
-    Trava a variável (com init=False) para impedir que qualquer se
-    crie uma ordem já dizendo que o saldo restante é diferente da quantidade original.
-    """
     def __post_init__(self) -> None:
         self.leaves_qty = self.qty
 
@@ -139,3 +124,92 @@ class BookSide:
         if peg is not None and peg.seq < real.seq:
             return peg, melhor
         return real, melhor
+
+    # ------------------------------------------------------------------
+    # Ordens limit reais (níveis de preço)
+    # ------------------------------------------------------------------
+
+    def add_order(self, order: Order) -> None:
+        """Insere uma ordem limit real ao final da fila do seu nível de preço.
+
+        Se o preço ainda não existir, cria a fila do nível e registra o preço
+        em ``prices`` mantendo a ordenação crescente (``bisect.insort``).
+        A ordem entra no fim da fila, preservando FIFO (menor ``seq`` primeiro).
+
+        Args:
+            order: Ordem do tipo LIMIT, com preço, pertencente a este lado.
+
+        Raises:
+            ValueError: se a ordem não for LIMIT, não tiver preço ou for do
+                lado oposto ao deste ``BookSide``.
+        """
+        if order.type is not OrderType.LIMIT or order.price is None:
+            raise ValueError("add_order aceita apenas ordens LIMIT com preço")
+        if order.side is not self.side:
+            raise ValueError("ordem pertence ao lado oposto do livro")
+
+        fila = self.levels.get(order.price)
+        if fila is None:
+            fila = self.levels[order.price] = OrderedDict()
+            insort(self.prices, order.price)
+        fila[order.id] = order
+
+    def remove_order(self, order: Order) -> None:
+        """Remove uma ordem limit real do seu nível de preço.
+
+        Invariante: se a fila ficar vazia, o nível é apagado de ``levels`` e o
+        preço é removido de ``prices`` na mesma operação. Assim, todo preço em
+        ``prices`` sempre possui ao menos uma ordem.
+
+        A localização do preço usa busca binária (O(log L)); a remoção do
+        vetor em si continua O(L) por deslocamento de memória, como esperado.
+
+        Args:
+            order: Ordem LIMIT atualmente presente neste lado do livro.
+
+        Raises:
+            KeyError: se o nível ou a ordem não existirem neste lado.
+        """
+        preco = order.price
+        fila = self.levels[preco]  # KeyError se o nível não existir
+        del fila[order.id]  # KeyError se a ordem não estiver no nível
+
+        # Se, ao remover a ordem, nn houver mas nenhuma no seu preço, 
+        # apaga a fila de tal preço
+
+        if not fila:
+            del self.levels[preco]
+            del self.prices[bisect_left(self.prices, preco)]
+
+    # ------------------------------------------------------------------
+    # Ordens pegged (fila VIP isolada)
+    # ------------------------------------------------------------------
+
+    def add_peg(self, order: Order) -> None:
+        """Insere uma ordem pegged ao final da fila ``pegs``.
+
+        Não toca em ``levels`` nem em ``prices``: o peg nunca é reprecificado
+        fisicamente, seu preço é derivado em ``head()``.
+
+        Args:
+            order: Ordem do tipo PEG pertencente a este lado.
+
+        Raises:
+            ValueError: se a ordem não for PEG ou for do lado oposto.
+        """
+        if not order.is_peg:
+            raise ValueError("add_peg aceita apenas ordens PEG")
+        if order.side is not self.side:
+            raise ValueError("ordem pertence ao lado oposto do livro")
+        self.pegs[order.id] = order
+
+    def remove_peg(self, order: Order) -> None:
+        """Remove uma ordem pegged da fila ``pegs``.
+
+        Args:
+            order: Ordem PEG atualmente presente neste lado do livro.
+
+        Raises:
+            KeyError: se a ordem não estiver em ``pegs``.
+        """
+        del self.pegs[order.id]
