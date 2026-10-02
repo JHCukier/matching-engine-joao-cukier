@@ -264,8 +264,6 @@ class MatchingEngine:
         # Peg não tem preço próprio (price=None): nunca agride, só repousa.
         if not incoming.is_peg:
             self._match(incoming)
-
-        # Depois de tentar atacar, checa se guarda ou já foi totalmente executada
  
         if incoming.leaves_qty > 0 and incoming.type is not OrderType.MARKET:
             lado = self.bids if incoming.side is Side.BUY else self.asks
@@ -314,14 +312,13 @@ class MatchingEngine:
                     oposto.remove_order(passiva)
                 del self.index[passiva.id]
  
-            if preco != preco_acum:  # mudou o preço: fecha a linha anterior, se for a primeira, ignora
+            if preco != preco_acum:  # mudou o preço: fecha a linha anterior
                 self._registrar_trade(preco_acum, qtd_acum)
                 preco_acum, qtd_acum = preco, 0
             qtd_acum += qtd
  
         self._registrar_trade(preco_acum, qtd_acum)
-
-    """Independência de estado: avalia os argumentos sem consultar ou alterar variáveis do motor."""
+ 
     @staticmethod
     def _favoravel(incoming: Order, preco: Decimal) -> bool:
         """Indica se ``preco`` respeita o limite da ordem agressora.
