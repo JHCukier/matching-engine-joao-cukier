@@ -30,6 +30,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 import sys
+from decimal import Decimal, DecimalException
 from decimal import Decimal, InvalidOperation
 
 
@@ -185,7 +186,7 @@ class BookSide:
         preco = order.price
         fila = self.levels[preco]  # KeyError se o nível não existir
         del fila[order.id]  # KeyError se a ordem não estiver no nível
-
+#elif comando == "cancel":
         if not fila:
             del self.levels[preco]
             del self.prices[bisect_left(self.prices, preco)]
@@ -259,10 +260,23 @@ class MatchingEngine:
                 sobrescrito pela engine.
 
         Raises:
-            ValueError: se o ``id`` já estiver em uso por uma ordem no livro.
+            ValueError: se o ``id`` já estiver em uso por uma ordem no livro,
+                se ``qty`` não for inteiro positivo, se o preço de uma LIMIT
+                não for ``Decimal`` finito e positivo ou se MARKET/PEG
+                trouxerem preço. A validação ocorre antes de consumir ``seq``
+                e de qualquer mutação do livro.
         """
         if incoming.id in self.index:
             raise ValueError(f"id de ordem duplicado: {incoming.id}")
+
+        # Validação de fronteira: antes de consumir seq ou tocar no livro.
+        if not isinstance(incoming.qty, int) or isinstance(incoming.qty, bool) or incoming.qty <= 0:
+            raise ValueError("qty deve ser um inteiro positivo")
+        if incoming.type is OrderType.LIMIT:
+            if not isinstance(incoming.price, Decimal) or not incoming.price.is_finite() or incoming.price <= 0:
+                raise ValueError("preço de LIMIT deve ser um Decimal finito e positivo")
+        elif incoming.price is not None:
+            raise ValueError("ordens MARKET e PEG não possuem preço")
 
         incoming.seq = next(self.seq_gen)
 
@@ -319,25 +333,34 @@ class MatchingEngine:
             * Nenhuma mudança efetiva: no-op.
 
         A alteração nunca agride o livro oposto: um novo preço que cruzaria o
-        spread é rejeitado. Toda validação ocorre antes de qualquer mutação,
-        então uma chamada que falha deixa o livro intacto.
+        spread é rejeitado. Os argumentos são validados na entrada (tipo,
+        finitude e positividade) e toda validação de negócio ocorre antes de
+        qualquer mutação, então uma chamada rejeitada deixa o livro intacto.
+        Isso não equivale a rollback geral: uma exceção inesperada *depois* da
+        validação (violação interna) não é desfeita.
 
         Args:
             order_id: Identificador da ordem em repouso.
-            new_qty: Nova quantidade restante (deve ser > 0).
-            new_price: Novo preço. ``None`` mantém o preço atual. Não se
-                aplica a ordens PEG.
+            new_qty: Nova quantidade restante (``int`` > 0).
+            new_price: Novo preço (``Decimal`` finito e > 0). ``None`` mantém o
+                preço atual. Não se aplica a ordens PEG.
 
         Raises:
             KeyError: se a ordem não existir em repouso (market nunca repousa).
-            ValueError: se ``new_qty <= 0``, se informar preço para um PEG ou
-                se o novo preço cruzaria o spread.
+            ValueError: se ``new_qty`` não for inteiro positivo, se
+                ``new_price`` não for ``Decimal`` finito e positivo, se
+                informar preço para um PEG ou se o novo preço cruzaria o spread.
         """
+        # Validação de fronteira: antes de qualquer lookup ou mutação.
+        if not isinstance(new_qty, int) or isinstance(new_qty, bool) or new_qty <= 0:
+            raise ValueError("new_qty deve ser um inteiro positivo; use cancel_order")
+        if new_price is not None:
+            if not isinstance(new_price, Decimal):
+                raise ValueError("new_price deve ser um Decimal")
+            if not new_price.is_finite() or new_price <= 0:  # exclui NaN e infinitos
+                raise ValueError("new_price deve ser finito e positivo")
+
         order = self.index[order_id]  # O(1); KeyError se não existir
-
-        if new_qty <= 0:
-            raise ValueError("new_qty deve ser positiva; use cancel_order")
-
         if order.is_peg:
             if new_price is not None:
                 raise ValueError("ordem PEG não possui preço próprio")
@@ -455,7 +478,7 @@ class MatchingEngine:
     def _registrar_trade(self, preco: Decimal | None, qtd: int) -> None:
         """Acrescenta uma linha em ``trades``. Ignora execuções vazias."""
         if preco is not None and qtd > 0:
-            self.trades.append(f"Trade, price: {preco}, qty: {qtd}")
+            self.trades.append(f"Trade, price: {preco:f}, qty: {qtd}")
 
 # ----------------------------------------------------------------------
 # Interface de terminal (I/O)
@@ -475,7 +498,7 @@ def _ordens_do_lado(lado: BookSide) -> list[tuple[Decimal | None, Order]]:
     resultado: list[tuple[Decimal | None, Order]] = []
 
     for preco in reversed(lado.prices):  # prices é crescente
-        ordens = list(lado.levels[preco].values())
+        ordens = list(lado.levels[preco].values())  
         if preco == melhor:
             ordens = sorted(ordens + list(lado.pegs.values()), key=lambda o: o.seq)
         resultado.extend((preco, o) for o in ordens)
@@ -491,7 +514,7 @@ def _formatar_ordem(preco: Decimal | None, ordem: Order) -> str:
         marca = "  [peg]" if preco is not None else "  [peg dormente]"
     else:
         marca = ""
-    preco_txt = "--" if preco is None else str(preco)
+    preco_txt = "--" if preco is None else f"{preco:f}"
     return f"  {ordem.leaves_qty} @ {preco_txt}  {ordem.id}{marca}"
 
 
@@ -536,19 +559,52 @@ def _parse_qtd(token: str) -> int:
     return qtd
 
 
-def _parse_preco(token: str) -> Decimal:
-    """Converte o token em ``Decimal`` positivo, em forma canônica.
+# Domínio de preços aceito pela CLI (ver ``_parse_preco``).
+_PRECO_TOKEN_MAX = 40  # caracteres do token
+_PRECO_INTEIROS_MAX = 12  # dígitos da parte inteira
+_PRECO_DECIMAIS_MAX = 8  # casas decimais reais (zeros à direita não contam)
 
-    A forma canônica (``10.0`` -> ``10``) evita representações distintas do
-    mesmo preço nas linhas de trade e no livro.
+
+def _parse_preco(token: str) -> Decimal:
+    """Converte o token em ``Decimal`` exato, positivo e de domínio limitado.
+
+    O valor nunca é arredondado: o ``Decimal`` devolvido é exatamente o
+    informado, a menos de zeros à direita, removidos manipulando o coeficiente
+    (aritmética inteira, sem passar pelo contexto decimal). Entradas fora do
+    domínio são rejeitadas, nunca truncadas.
+
+    Domínio aceito: finito, estritamente positivo, até 12 dígitos inteiros e
+    até 8 casas decimais reais. Isso limita o preço a 20 dígitos significativos
+    (abaixo dos 28 do contexto padrão) e impede underflow para zero e
+    expansão de memória por expoentes absurdos (``1e999999``).
+
+    Raises:
+        ValueError: token inválido ou fora do domínio aceito.
     """
+    if len(token) > _PRECO_TOKEN_MAX:
+        raise ValueError(f"preço longo demais (máx. {_PRECO_TOKEN_MAX} caracteres)")
     try:
         preco = Decimal(token)
     except InvalidOperation:
         raise ValueError(f"preço inválido: {token!r}") from None
     if not preco.is_finite() or preco <= 0:
         raise ValueError(f"preço deve ser finito e positivo: {token!r}")
-    return Decimal(format(preco.normalize(), "f"))
+
+    _, digitos, expoente = preco.as_tuple()
+    digitos = list(digitos)
+    while len(digitos) > 1 and digitos[-1] == 0:  # zeros à direita não contam
+        digitos.pop()
+        expoente += 1
+
+    if -expoente > _PRECO_DECIMAIS_MAX:
+        raise ValueError(f"preço aceita no máximo {_PRECO_DECIMAIS_MAX} casas decimais: {token!r}")
+    if len(digitos) + expoente > _PRECO_INTEIROS_MAX:
+        raise ValueError(f"preço aceita no máximo {_PRECO_INTEIROS_MAX} dígitos inteiros: {token!r}")
+
+    if expoente > 0:  # forma canônica sem notação científica: 1E+2 -> 100
+        digitos.extend([0] * expoente)
+        expoente = 0
+    return Decimal((0, tuple(digitos), expoente))
 
 
 def _gerar_id(engine: MatchingEngine, contador: "itertools.count[int]") -> str:
@@ -604,7 +660,7 @@ def _executar_comando(
         qtd = _parse_qtd(args[2])
         oid = args[3] if len(args) == 4 else _gerar_id(engine, contador)
         ordem = Order(oid, lado, OrderType.LIMIT, qtd, price=preco)
-        _submeter(engine, ordem, f"{lado.value} {qtd} @ {preco}")
+        _submeter(engine, ordem, f"{lado.value} {qtd} @ {preco:f}")
 
     elif cmd == "market":
         if len(args) not in (2, 3):
@@ -613,7 +669,7 @@ def _executar_comando(
         qtd = _parse_qtd(args[1])
         oid = args[2] if len(args) == 3 else _gerar_id(engine, contador)
         _submeter(engine, Order(oid, lado, OrderType.MARKET, qtd), None)
-
+#_formatar_ordem
     elif cmd == "peg":
         ref = None
         if args and args[0].lower() in ("bid", "offer"):
@@ -641,9 +697,9 @@ def _executar_comando(
             raise ValueError("uso: cancel [order] <order_id>")
         try:
             engine.cancel_order(args[0])
+            print("Order cancelled")
         except KeyError:
-            raise ValueError(f"ordem inexistente ou já finalizada: {args[0]}") from None
-        print("Order cancelled")
+            raise ValueError(f"ordem inexistente ou já finalizada: {args[0]}")
 
     elif cmd == "amend":
         if len(args) not in (2, 3):
@@ -680,10 +736,12 @@ def main() -> None:
                 continue
             try:
                 _executar_comando(engine, contador, linha)
-            except ValueError as e:
+            except (ValueError, DecimalException) as e:
+                # Erro de entrada/negócio: reporta e segue a sessão.
                 print(f"Erro: {e}")
-            except Exception as e:  # falha inesperada: não derruba a sessão
-                print(f"Erro interno ({type(e).__name__}): {e}")
+            # Qualquer outra exceção (KeyError e RuntimeError inclusive: o
+            # KeyError esperado já virou ValueError em _executar_comando)
+            # propaga de propósito: fail-fast, o processo cai.
     except KeyboardInterrupt:
         print()
     finally:

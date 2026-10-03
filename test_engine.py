@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import sys
 from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import pytest
 
@@ -633,7 +634,20 @@ class TestPegs:
 
 @pytest.fixture
 def cli(monkeypatch, capsys):
-    """Executa ``main()`` com as linhas dadas em ``stdin``; devolve o stdout."""
+    """Executa ``main()`` com as linhas dadas em ``stdin``; devolve o stdout.
+
+    Audita a engine criada dentro de ``main()`` após *cada* comando (mesmo os
+    rejeitados): uma violação de invariante aparece como falha do teste.
+    """
+    original = matching_engine._executar_comando
+
+    def auditado(engine, contador, linha):
+        try:
+            original(engine, contador, linha)
+        finally:
+            _verificar_invariantes(engine)
+
+    monkeypatch.setattr(matching_engine, "_executar_comando", auditado)
 
     def executar(*linhas: str) -> list[str]:
         monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(linhas) + "\n"))
@@ -710,3 +724,156 @@ class TestCancelamentoEIO:
             "  200 @ 10  b1",
             "  100 @ 9.99  b2",
         ]
+        # ----------------------------------------------------------------------
+# 7. Regressões da auditoria (fronteiras da API, parser e fail-fast)
+# ----------------------------------------------------------------------
+
+
+class TestFronteiraDaApi:
+    @pytest.mark.parametrize(
+        "new_qty",
+        [float("inf"), float("nan"), 10.0, "10", True, None, 0, -1],
+        ids=["inf", "nan", "float", "str", "bool", "none", "zero", "negativo"],
+    )
+    def test_amend_rejeita_quantidade_invalida_e_livro_fica_intacto(self, engine, new_qty):
+        place(engine, limit("b1", BUY, "10", 10), limit("b2", BUY, "9", 10))
+        antes = _snapshot(engine)
+
+        with pytest.raises(ValueError):
+            engine.amend_order("b1", new_qty)
+
+        assert _snapshot(engine) == antes
+
+    @pytest.mark.parametrize(
+        "novo_preco",
+        [Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("-Infinity"),
+         Decimal("0"), Decimal("-1"), 9.5, "9"],
+        ids=["nan", "snan", "inf", "-inf", "zero", "negativo", "float", "str"],
+    )
+    def test_amend_rejeita_preco_invalido_e_livro_fica_intacto(self, engine, novo_preco):
+        place(engine, limit("b1", BUY, "10", 10), limit("b2", BUY, "9", 10))
+        antes = _snapshot(engine)
+
+        with pytest.raises(ValueError):
+            engine.amend_order("b1", 10, novo_preco)
+
+        assert _snapshot(engine) == antes
+        engine.cancel_order("b1")  # sem estado fantasma: o cancelamento funciona
+
+
+class TestParsePreco:
+    @pytest.mark.parametrize(
+        "token, esperado",
+        [("10", "10"), ("10.0", "10"), ("100", "100"), ("1E+2", "100"), ("9.990", "9.99"),
+         ("0.00000001", "0.00000001"), ("999999999999.99999999", "999999999999.99999999")],
+    )
+    def test_aceita_sem_arredondar(self, token, esperado):
+        assert matching_engine._parse_preco(token) == Decimal(esperado)
+
+    @pytest.mark.parametrize("token, texto", [("10.0", "10"), ("1E+2", "100"), ("9.990", "9.99")])
+    def test_forma_canonica_sem_notacao_cientifica(self, token, texto):
+        assert str(matching_engine._parse_preco(token)) == texto
+
+    @pytest.mark.parametrize(
+        "token",
+        ["9.9999999999999999999999999999", "1e-1000027", "0.000000001", "1e999999",
+         "1000000000000", "1" * 41, "NaN", "Infinity", "-1", "0", "abc"],
+    )
+    def test_rejeita_fora_do_dominio(self, token):
+        with pytest.raises(ValueError):
+            matching_engine._parse_preco(token)
+
+    def test_cli_nao_executa_acima_do_limite_de_compra(self, cli):
+        saida = cli("limit sell 10 1 ask", "limit buy 9.9999999999999999999999999999 1 bid")
+        assert saida[0] == "Order created: sell 1 @ 10 ask"
+        assert saida[1].startswith("Erro:")
+        assert not any(linha.startswith("Trade") for linha in saida)
+
+
+class TestFailFast:
+    def test_runtimeerror_derruba_o_main(self, monkeypatch, cli):
+        def quebrado(self, ordem):
+            raise RuntimeError("Invariante violada")
+
+        monkeypatch.setattr(MatchingEngine, "process_order", quebrado)
+        with pytest.raises(RuntimeError):
+            cli("limit buy 10 1 x", "limit buy 10 1 y")
+
+    def test_erro_decimal_continua_a_sessao(self, monkeypatch, cli):
+        original = MatchingEngine.process_order
+
+        def instavel(self, ordem):
+            if ordem.id == "d":
+                raise InvalidOperation("d")
+            return original(self, ordem)
+
+        monkeypatch.setattr(MatchingEngine, "process_order", instavel)
+        saida = cli("limit buy 10 1 d", "limit buy 10 1 ok")
+
+        assert saida[0].startswith("Erro")
+        assert saida[-1] == "Order created: buy 1 @ 10 ok"
+
+    def test_keyerror_que_chega_ao_main_derruba_o_processo(self, monkeypatch, cli):
+        def quebrado(self, ordem):
+            raise KeyError("indice corrompido")
+
+        monkeypatch.setattr(MatchingEngine, "process_order", quebrado)
+        with pytest.raises(KeyError):
+            cli("limit buy 10 1 x")
+
+class TestFronteiraDoProcessOrder:
+    @pytest.mark.parametrize(
+        "preco",
+        [Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), Decimal("-Infinity"),
+         Decimal("0"), Decimal("-1"), 10.5, "10", None],
+        ids=["nan", "snan", "inf", "-inf", "zero", "negativo", "float", "str", "none"],
+    )
+    def test_limit_com_preco_invalido_e_rejeitada_sem_tocar_no_livro(self, engine, preco):
+        b2 = place(engine, limit("b2", BUY, "9", 10))
+        antes = _snapshot(engine)
+        invalida = Order("x", BUY, OrderType.LIMIT, 10, price=preco)
+
+        with pytest.raises(ValueError):
+            engine.process_order(invalida)
+
+        assert _snapshot(engine) == antes  # sem nível fantasma, sem entrada no index
+        assert invalida.seq == 0
+        assert place(engine, limit("y", BUY, "8", 1)).seq == b2.seq + 1  # seq não consumido
+
+    @pytest.mark.parametrize("tipo", [OrderType.LIMIT, OrderType.MARKET, OrderType.PEG])
+    @pytest.mark.parametrize(
+        "qty",
+        [0, -1, 1.5, float("inf"), float("nan"), True, "10", None],
+        ids=["zero", "negativa", "float", "inf", "nan", "bool", "str", "none"],
+    )
+    def test_qty_invalida_e_rejeitada_sem_tocar_no_livro(self, engine, tipo, qty):
+        place(engine, limit("a", SELL, "20", 10))
+        antes = _snapshot(engine)
+        preco = Decimal("21") if tipo is OrderType.LIMIT else None
+
+        with pytest.raises(ValueError, match="qty"):
+            engine.process_order(Order("x", BUY, tipo, qty, price=preco))
+
+        assert _snapshot(engine) == antes
+
+    @pytest.mark.parametrize("tipo", [OrderType.MARKET, OrderType.PEG])
+    def test_market_e_peg_nao_aceitam_preco(self, engine, tipo):
+        antes = _snapshot(engine)
+
+        with pytest.raises(ValueError, match="preço"):
+            engine.process_order(Order("x", BUY, tipo, 10, price=Decimal("10")))
+
+        assert _snapshot(engine) == antes
+
+
+class TestNotacaoCientifica:
+    def test_preco_pequeno_e_impresso_em_notacao_plana(self, cli):
+        saida = cli("limit sell 0.00000001 1 a", "market buy 1")
+        assert saida == [
+            "Order created: sell 1 @ 0.00000001 a",
+            "Trade, price: 0.00000001, qty: 1",
+        ]
+
+    def test_book_tambem_usa_notacao_plana(self, cli):
+        saida = cli("limit sell 0.00000001 1 a", "print")
+        assert "  1 @ 0.00000001  a" in saida
