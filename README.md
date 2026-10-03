@@ -11,8 +11,8 @@ A arquitetura do motor foi projetada para lidar com uma contradição inerente �
 A solução foi separar as responsabilidades dentro da classe `BookSide` (o hemisfério de Compra ou Venda), dividindo a estrutura de dados em componentes matemáticos dedicados:
 
 * **A Cisão entre `prices` (Vetor) e `levels` (Mapa):**
-  * **O Problema:** Se usássemos apenas um dicionário, perderíamos a capacidade de saber rapidamente qual é o melhor preço (dicionários não ordenam valores). Se usássemos apenas uma lista simples, cancelar uma ordem exigiria varrer tudo em `O(N)`.
-  * **A Solução:** Separamos a Prioridade de Preço da Prioridade de Tempo. O vetor `prices` gerencia os preços estritamente via busca binária (`bisect`), o que garante a localização de qualquer nível de preço em `O(log N)`. Como a lista está sempre ordenada, consultar o topo do livro custa absolutos `O(1)` (basta ler a ponta do vetor). Paralelamente, o dicionário `levels` mapeia o preço para uma fila `OrderedDict`, permitindo remover qualquer ordem no meio da fila também em latência `O(1)`.
+  * **O Problema:** Se usássemos apenas um dicionário, perderíamos a capacidade de saber rapidamente qual é o melhor preço. Se usássemos apenas uma lista simples, cancelar uma ordem exigiria varrer tudo em `O(N)`.
+  * **A Solução:** Separamos a Prioridade de Preço da Prioridade de Tempo. O vetor `prices` gerencia os preços via busca binária (`bisect`). A localização do preço custa **O(log L)** (onde L é o número de níveis ativos). A inserção ou exclusão de um nível exige o deslocamento do vetor, custando **O(L)** no pior caso, o que é eficiente na prática, pois L é ordens de grandeza menor que o total de ordens no livro. Paralelamente, o dicionário `levels` mapeia o preço para uma fila `OrderedDict`, permitindo remover ordens intermediárias com latência **O(1) esperado** (sujeito à teórica colisão de hash).
 
 * **O Isolamento de `pegs` (A Fila Passiva):**
   * **O Problema:** O enunciado exige que ordens Pegged acompanhem o melhor preço do seu lado. Se injetássemos os Pegs dentro das gavetas de `levels`, um sobressalto no mercado obrigaria o motor a varrer o livro e recriar os Pegs em novas gavetas físicas o tempo todo.
@@ -48,13 +48,14 @@ A mutação de ordens em repouso é o vetor mais comum de bugs em exchanges. As 
 * **Relógio Determinístico (`seq`):** Para mitigar colisões de concorrência onde duas ordens chegam no mesmo milissegundo, abandonamos os carimbos de tempo (`timestamps`). O motor de prioridade usa um gerador determinístico inteiro (`itertools.count`).
 * **Sweeping the Book:** Limit Orders agressivas (Marketable Limits) estão configuradas para varrer o livro adversário. Elas consomem múltiplos níveis de preço, recalculando o saldo continuamente até que o `leaves_qty` chegue a zero ou o preço limite estoure.
 * **Consolidação de Trades:** Execuções parciais consecutivas consumindo múltiplas ordens no mesmo nível de preço são consolidadas em um único registro no log.
+* **Fronteira de Confiança e Sanitização (CLI):** O núcleo da API valida a finitude e a tipagem estrita (`NaN`, `Inf`) antes de qualquer mutação. Para evitar ataques de exaustão de memória ou corrupção de escala via terminal, a CLI implementa um *parser* determinístico que limita o preço a 12 dígitos inteiros e 8 decimais reais.
 
 ## 5. Auditoria de Invariantes e Política Fail-Fast
 
 O motor foi construído sob o princípio Pythonico EAFP (Easier to Ask for Forgiveness than Permission).
 
 * Em vez de sobrecarregar o fluxo crítico com múltiplos blocos condicionais de verificação, os métodos de remoção delegam a validação de existência diretamente para a implementação em C do interpretador, capturando o `KeyError` nativo em caso de violação.
-* **Falha Dura (`RuntimeError`):** Se, por qualquer desvio matemático, o topo do vetor de preços apontar para uma gaveta vazia, o sistema é projetado para levantar um erro crítico imediato, preferindo interromper o fluxo a operar com base em um "estado fantasma".
+* **Falha Dura (`RuntimeError`) e Fail-Fast:** Se o vetor de preços apontar para uma gaveta vazia, o sistema levanta um erro estrutural crítico. A interface de terminal (CLI) respeita estritamente esse princípio: falhas de negócio (`ValueError`, `KeyError`) são reportadas no log, mas qualquer anomalia estrutural interna não tratada derruba o processo inteiro imediatamente, impedindo a engine de operar sobre um "estado fantasma".
 
 ### A Suíte de Testes (Pytest)
 
