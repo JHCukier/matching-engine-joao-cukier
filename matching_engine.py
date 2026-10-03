@@ -28,8 +28,9 @@ import itertools
 from bisect import bisect_left, insort
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from decimal import Decimal
 from enum import Enum
+import sys
+from decimal import Decimal, InvalidOperation
 
 
 class Side(str, Enum):
@@ -352,7 +353,7 @@ class MatchingEngine:
         if mudou_preco and self._cruzaria(order, preco_alvo):
             raise ValueError("alteração cruzaria o spread; amend nunca agride")
 
-        executado = order.qty - order.leaves_qty
+        executado = order.qty - order.leaves_qty #o que já foi executado
 
         if not mudou_preco and new_qty < order.leaves_qty:
             # Redução estrita: atualiza no lugar, preservando seq e posição.
@@ -455,3 +456,239 @@ class MatchingEngine:
         """Acrescenta uma linha em ``trades``. Ignora execuções vazias."""
         if preco is not None and qtd > 0:
             self.trades.append(f"Trade, price: {preco}, qty: {qtd}")
+
+# ----------------------------------------------------------------------
+# Interface de terminal (I/O)
+# ----------------------------------------------------------------------
+
+
+def _ordens_do_lado(lado: BookSide) -> list[tuple[Decimal | None, Order]]:
+    """Lista as ordens de um lado na ordem de exibição, do maior ao menor preço.
+
+    Dentro de cada nível a ordem é a de prioridade (FIFO por ``seq``). Os pegs
+    herdam o melhor preço do lado e são intercalados com as ordens reais desse
+    nível pelo ``seq``. Pegs sem referência (dormentes) vêm ao final, sem preço.
+
+    Não altera o estado do livro.
+    """
+    melhor = lado.best_price()
+    resultado: list[tuple[Decimal | None, Order]] = []
+
+    for preco in reversed(lado.prices):  # prices é crescente
+        ordens = list(lado.levels[preco].values())
+        if preco == melhor:
+            ordens = sorted(ordens + list(lado.pegs.values()), key=lambda o: o.seq)
+        resultado.extend((preco, o) for o in ordens)
+
+    if melhor is None:
+        resultado.extend((None, p) for p in lado.pegs.values())
+    return resultado
+
+
+def _formatar_ordem(preco: Decimal | None, ordem: Order) -> str:
+    """Formata uma linha do livro: ``<restante> @ <preço>  <id>``."""
+    if ordem.is_peg:
+        marca = "  [peg]" if preco is not None else "  [peg dormente]"
+    else:
+        marca = ""
+    preco_txt = "--" if preco is None else str(preco)
+    return f"  {ordem.leaves_qty} @ {preco_txt}  {ordem.id}{marca}"
+
+
+def print_book(engine: MatchingEngine) -> None:
+    """Imprime o livro: vendas (maior -> menor preço), depois compras (idem).
+
+    Cada linha mostra a quantidade restante (``leaves_qty``), o preço e o id.
+    """
+    print("Ordens de Venda (Asks)")
+    linhas = _ordens_do_lado(engine.asks)
+    for preco, ordem in linhas:
+        print(_formatar_ordem(preco, ordem))
+    if not linhas:
+        print("  (vazio)")
+
+    print("-" * 40)
+
+    print("Ordens de Compra (Bids)")
+    linhas = _ordens_do_lado(engine.bids)
+    for preco, ordem in linhas:
+        print(_formatar_ordem(preco, ordem))
+    if not linhas:
+        print("  (vazio)")
+
+
+def _parse_lado(token: str) -> Side:
+    """Converte ``buy``/``sell`` (sem distinguir maiúsculas) em ``Side``."""
+    try:
+        return Side(token.lower())
+    except ValueError:
+        raise ValueError(f"lado inválido: {token!r} (use buy ou sell)") from None
+
+
+def _parse_qtd(token: str) -> int:
+    """Converte o token em quantidade inteira positiva."""
+    try:
+        qtd = int(token)
+    except ValueError:
+        raise ValueError(f"quantidade inválida: {token!r}") from None
+    if qtd <= 0:
+        raise ValueError("quantidade deve ser positiva")
+    return qtd
+
+
+def _parse_preco(token: str) -> Decimal:
+    """Converte o token em ``Decimal`` positivo, em forma canônica.
+
+    A forma canônica (``10.0`` -> ``10``) evita representações distintas do
+    mesmo preço nas linhas de trade e no livro.
+    """
+    try:
+        preco = Decimal(token)
+    except InvalidOperation:
+        raise ValueError(f"preço inválido: {token!r}") from None
+    if not preco.is_finite() or preco <= 0:
+        raise ValueError(f"preço deve ser finito e positivo: {token!r}")
+    return Decimal(format(preco.normalize(), "f"))
+
+
+def _gerar_id(engine: MatchingEngine, contador: "itertools.count[int]") -> str:
+    """Gera um id sequencial que não colida com ordens em repouso."""
+    while True:
+        candidato = f"identificador_{next(contador)}"
+        if candidato not in engine.index:
+            return candidato
+
+
+def _submeter(engine: MatchingEngine, ordem: Order, resumo: str | None) -> None:
+    """Envia a ordem à engine e imprime a confirmação e os trades gerados.
+
+    Args:
+        engine: Motor de matching.
+        ordem: Ordem já validada.
+        resumo: Texto de ``Order created`` (sem o id). ``None`` suprime a
+            confirmação (usado por market, que nunca repousa).
+    """
+    antes = len(engine.trades)
+    engine.process_order(ordem)
+    if resumo is not None:
+        print(f"Order created: {resumo} {ordem.id}")
+    for trade in engine.trades[antes:]:
+        print(trade)
+
+
+def _executar_comando(
+    engine: MatchingEngine, contador: "itertools.count[int]", linha: str
+) -> None:
+    """Interpreta e executa uma linha de comando.
+
+    Comandos:
+        limit <side> <price> <qty> [order_id]
+        market <side> <qty> [order_id]
+        peg [bid|offer] <side> <qty> [order_id]
+        cancel [order] <order_id>
+        amend <order_id> <new_qty> [new_price]
+        print
+
+    Raises:
+        ValueError: comando desconhecido, argumentos inválidos ou regra de
+            negócio violada (ordem inexistente, cruzamento no amend etc.).
+    """
+    tokens = linha.split()
+    cmd, args = tokens[0].lower(), tokens[1:]
+
+    if cmd == "limit":
+        if len(args) not in (3, 4):
+            raise ValueError("uso: limit <buy|sell> <price> <qty> [order_id]")
+        lado = _parse_lado(args[0])
+        preco = _parse_preco(args[1])
+        qtd = _parse_qtd(args[2])
+        oid = args[3] if len(args) == 4 else _gerar_id(engine, contador)
+        ordem = Order(oid, lado, OrderType.LIMIT, qtd, price=preco)
+        _submeter(engine, ordem, f"{lado.value} {qtd} @ {preco}")
+
+    elif cmd == "market":
+        if len(args) not in (2, 3):
+            raise ValueError("uso: market <buy|sell> <qty> [order_id]")
+        lado = _parse_lado(args[0])
+        qtd = _parse_qtd(args[1])
+        oid = args[2] if len(args) == 3 else _gerar_id(engine, contador)
+        _submeter(engine, Order(oid, lado, OrderType.MARKET, qtd), None)
+
+    elif cmd == "peg":
+        ref = None
+        if args and args[0].lower() in ("bid", "offer"):
+            ref, args = args[0].lower(), args[1:]
+        if len(args) not in (2, 3):
+            raise ValueError("uso: peg [bid|offer] <buy|sell> <qty> [order_id]")
+        lado = _parse_lado(args[0])
+        qtd = _parse_qtd(args[1])
+        # O peg segue o próprio lado: bid <-> buy, offer <-> sell.
+        esperado = "bid" if lado is Side.BUY else "offer"
+        if ref is not None and ref != esperado:
+            raise ValueError(
+                "peg bid exige lado buy e peg offer exige lado sell "
+                "(o contrário cruzaria o spread)"
+            )
+        oid = args[2] if len(args) == 3 else _gerar_id(engine, contador)
+        _submeter(
+            engine, Order(oid, lado, OrderType.PEG, qtd), f"{lado.value} {qtd} @ peg {esperado}"
+        )
+
+    elif cmd == "cancel":
+        if len(args) == 2 and args[0].lower() == "order":
+            args = args[1:]
+        if len(args) != 1:
+            raise ValueError("uso: cancel [order] <order_id>")
+        try:
+            engine.cancel_order(args[0])
+        except KeyError:
+            raise ValueError(f"ordem inexistente ou já finalizada: {args[0]}") from None
+        print("Order cancelled")
+
+    elif cmd == "amend":
+        if len(args) not in (2, 3):
+            raise ValueError("uso: amend <order_id> <new_qty> [new_price]")
+        qtd = _parse_qtd(args[1])
+        preco = _parse_preco(args[2]) if len(args) == 3 else None
+        try:
+            engine.amend_order(args[0], qtd, preco)
+        except KeyError:
+            raise ValueError(f"ordem inexistente ou já finalizada: {args[0]}") from None
+        print("Order amended")
+
+    elif cmd == "print":
+        print_book(engine)
+
+    else:
+        raise ValueError(f"comando desconhecido: {tokens[0]!r}")
+
+
+def main() -> None:
+    """Lê comandos de ``sys.stdin`` linha a linha e os executa na engine.
+
+    Erros de um comando são impressos e não interrompem a sessão. O programa
+    encerra ao fim da entrada (EOF) ou com Ctrl+C.
+    """
+    engine = MatchingEngine()
+    contador = itertools.count(1)
+
+    try:
+        for linha in sys.stdin:
+            # Tolera o prompt ">>>" do enunciado ao colar exemplos.
+            linha = linha.strip().lstrip(">").strip()
+            if not linha:
+                continue
+            try:
+                _executar_comando(engine, contador, linha)
+            except ValueError as e:
+                print(f"Erro: {e}")
+            except Exception as e:  # falha inesperada: não derruba a sessão
+                print(f"Erro interno ({type(e).__name__}): {e}")
+    except KeyboardInterrupt:
+        print()
+    finally:
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
