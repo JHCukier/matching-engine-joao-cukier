@@ -89,3 +89,27 @@ Certifique-se de possuir o `pytest` instalado e execute na raiz do diretório:
 ```bash
 pytest test_engine.py -v
 ```
+
+## Demonstração Prática e Casos Extremos
+
+Para facilitar a avaliação técnica, abaixo estão execuções do motor validando cenários complexos da arquitetura e da microestrutura do livro de ofertas.
+
+### 1. Auditoria e Bateria de Testes
+A suíte completa validando 138 casos de uso e *edge cases* em frações de segundo, cobrindo desde execução FIFO até falhas estruturais (*fail-fast*).
+![Resultado dos Testes](docs/testes.png)
+
+### 2. Execução Standard (Matching & FIFO)
+Motor processando a entrada passiva de liquidez e cruzando ordens agressoras, demonstrando o consumo correto do volume e o respeito à prioridade de tempo.
+![Caso de Uso Básico](docs/basico.png)
+
+### 3. Segurança de Fronteira e Limites de Memória
+A API blindada contra injeções anômalas: o *parser* da CLI rejeita valores que excedem 12 dígitos inteiros (prevenindo *overflow* e quebra de formatação) e o motor rejeita agressões que cruzariam o *spread* em repouso.
+![Caso de Uso Segurança](docs/seguranca.png)
+
+### 4. Rastreamento Dinâmico (Ordens Peg)
+A ordem Peg flutuando e ancorando instantaneamente em um novo preço assim que um novo melhor nível de liquidez é estabelecido no mercado.
+![Caso de Uso Peg Simples](docs/peg.png)
+
+### 5. Varredura a Mercado (*Sweep*) e Reprecificação
+Um teste de *stress* do algoritmo: uma ordem *Market* massiva varre múltiplos níveis de preço. Simultaneamente, a ordem Peg rastreia o consumo do *spread*, desliza para o novo nível de preço e é executada, preservando a sua lógica temporal de fila.
+![Caso de Uso Peg e Market](docs/peg_sweep.png)
